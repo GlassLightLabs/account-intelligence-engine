@@ -1,0 +1,6 @@
+Account: Demo Co
+
+SITE     PERIOD   LABOR EFFICIENCY  CHANGE    GATE 1     OPEN  ATTENTION
+site-01  2026-09  88.4%             +0.5 pts  VALIDATED  0     -
+site-02  2026-09  78.2%             -4.0 pts  VALIDATED  6     efficiency_drop, below_target, lost_hours_spike, sustained_decline
+site-03  2026-09  89.5%             +2.1 pts  VALIDATED  0     -

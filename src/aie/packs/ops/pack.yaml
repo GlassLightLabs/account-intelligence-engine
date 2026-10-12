@@ -1,0 +1,257 @@
+# Domain pack: multi-site operations labor performance.
+#
+# This file is the SPEC. Both the analysis engine (aie) and the independent
+# integrity engine (aie_integrity) read it, but each implements the math on
+# its own. Shared requirements, separate code. A copy is frozen into each
+# account folder at `aie init`, so results stay reproducible if the pack
+# changes later.
+
+name: ops
+version: 5
+description: >
+  Labor performance for multi-site operations (plants, warehouses, kitchens,
+  service centers). Measures how many standard ("earned") hours of work were
+  produced for every paid hour, where the gap goes, and what drives downtime.
+
+period: monthly   # periods are YYYY-MM
+
+# Reading rules (both engines implement these):
+#   * Header names are matched after trimming, lowercasing, and turning spaces and
+#     hyphens into underscores ("Paid Hours " -> paid_hours). Extra columns are ignored.
+#   * CSV delimiter is ',' unless no header is found that way, then ';', then tab.
+#   * The header row is the first row, within the first 20, that contains every
+#     required column. Report-title lines above it are ignored. For .xlsx, sheets are
+#     searched in order and the first sheet with such a header is used.
+#   * Rows where every cell is blank are ignored, and so are rows that repeat the
+#     header (paged reports).
+#   * Rows whose first cell matches `total_row_pattern` (case-insensitive) are
+#     report totals, not data. They are ignored and counted as `total_rows`.
+#   * `rows` in the input metadata counts data rows after those removals.
+# Column types:
+#   str    trimmed text, must not be blank
+#   id     trimmed and uppercased ("b1005 " -> "B1005"), must not be blank
+#   cat    trimmed, lowercased, '-' and '_' become spaces, repeated spaces collapse
+#          ("CONVEYOR-JAM " -> "conveyor jam"), must not be blank
+#   cat?   like cat, but a blank becomes "(blank)"
+#   key    an identifier: trimmed, lowercased, spaces and hyphens become '_'
+#          ("Paid Hours" -> paid_hours), must not be blank
+#   float  a number, must not be blank. Comma thousands separators are accepted only
+#          in the strict form 1,234 or 1,234.5 (groups of exactly three digits).
+#   date   parsed with the first of `date_formats` that parses every value in the column.
+#          A column that mixes formats is rejected rather than guessed.
+total_row_pattern: '^\s*(grand\s+)?(sub)?totals?\b'
+date_formats: ['%Y-%m-%d', '%m/%d/%Y']
+files:
+  employees:
+    filename: employees          # .csv or .xlsx
+    required: true
+    key: employee_id
+    columns:
+      employee_id: id
+      department: cat
+      classification: cat        # standard | trainee | contractor | supervisor
+      status: cat                # active | inactive
+  labor:
+    filename: labor
+    required: true
+    columns:
+      date: date
+      employee_id: id
+      department: cat?
+      paid_hours: float
+      earned_hours: float
+  downtime:
+    filename: downtime
+    required: false
+    columns:
+      date: date
+      department: cat
+      reason: cat
+      minutes: float
+  source_summary:
+    filename: source_summary     # totals the source system reports about itself
+    required: false
+    columns:
+      metric: key                # matched against the metric names above
+      value: float
+
+# How a labor row is classified (each row lands in exactly one bucket, checked in this order):
+#   1. out_of_period: the row's date is not in the period being analyzed
+#   2. duplicate: identical in every column to an earlier row in the file (re-export overlap)
+#   3. unmatched: employee_id is not in employees
+#   4. policy_excluded: employee classification is in efficiency_excluded_classifications
+#   5. outlier: paid_hours == 0, paid_hours > max_paid_hours_per_row,
+#               or (paid_hours > 0 and earned_hours / paid_hours > max_row_efficiency)
+#   6. eligible: everything else. Efficiency, paid, earned, and lost hours use eligible rows only.
+# Rows with negative paid_hours are payroll corrections (reversals). They are eligible, so they
+# net against the entries they reverse, and are also counted as correction_rows.
+# excluded_rows = out_of_period + duplicate + unmatched + outlier (data problems).
+# lost_hours = paid_hours - earned_hours.
+# active_headcount = employees with status 'active'. downtime_hours = sum(minutes) / 60.
+rules:
+  # Classifications left out of efficiency math (still counted in headcount).
+  efficiency_excluded_classifications: [trainee, supervisor]
+  # A labor row is treated as a data error and excluded if it breaks either limit.
+  max_paid_hours_per_row: 16
+  max_row_efficiency: 2.0
+  top_n: 5
+  baseline_periods: 3            # trailing periods averaged for the baseline
+# Comparison definitions (both engines implement these):
+#   previous = the latest stored period before the current one
+#   delta    = current - previous
+#   baseline = mean of the last `baseline_periods` stored periods before the current one
+#   zscore   = (current - baseline) / sample standard deviation of those same periods
+
+metrics:
+  efficiency:        {label: Labor efficiency,      format: pct1, higher_is_better: true}
+  paid_hours:        {label: Paid hours,            format: num1}
+  earned_hours:      {label: Earned hours,          format: num1, higher_is_better: true}
+  lost_hours:        {label: Lost hours,            format: num1, higher_is_better: false}
+  paid_hours_per_shift: {label: Average paid hours per shift, format: num2}   # paid_hours / eligible rows
+  downtime_hours:    {label: Downtime hours,        format: num1, higher_is_better: false}
+  active_headcount:  {label: Active headcount,      format: int}
+  excluded_rows:     {label: Labor rows excluded as data errors, format: int, higher_is_better: false}
+  outlier_rows:      {label: Outlier labor rows,    format: int,  higher_is_better: false}
+  unmatched_rows:    {label: Labor rows with unknown employee, format: int, higher_is_better: false}
+  duplicate_rows:    {label: Duplicate labor rows dropped, format: int, higher_is_better: false}
+  out_of_period_rows: {label: Labor rows dated outside the period, format: int, higher_is_better: false}
+  correction_rows:   {label: Payroll correction rows, format: int}
+  policy_excluded_rows: {label: Labor rows excluded by classification, format: int}
+
+breakdowns:
+  efficiency_by_department: {label: Efficiency by department, format: pct1}
+  downtime_by_reason:       {label: Downtime hours by reason, format: num1, ranked: true}
+  top_lost_hours_employees: {label: Lost hours by employee,  format: num1, ranked: true, internal: true}
+  # Driver analysis (root-cause evidence). compare: false = not compared period to period.
+  # For each reason in downtime_by_reason: efficiency of eligible labor rows in the departments
+  # where that reason was logged, split into dates with at least one such event ("<reason>: event days")
+  # and all other dates ("<reason>: other days"). A side with no paid hours is omitted.
+  # If both sides are about equal, that downtime reason does not explain the efficiency level.
+  downtime_day_efficiency:  {label: Efficiency on downtime-event days vs other days, format: pct1, compare: false}
+  # Efficiency of eligible labor rows by week, keyed by the Monday that starts the week (YYYY-MM-DD).
+  weekly_efficiency:        {label: Weekly efficiency (week starting), format: pct1, compare: false}
+  # Efficiency of eligible labor rows by day of week, keyed mon..sun, in weekday order. Days with no paid hours omitted.
+  weekday_efficiency:       {label: Efficiency by day of week, format: pct1, compare: false}
+  # Efficiency per employee over eligible rows, keyed by employee_id, sorted by key. Used to judge whether a change
+  # is broad (most people) or concentrated (a few people). Individual-level, so internal.
+  employee_efficiency:      {label: Efficiency by employee, format: pct1, compare: false, internal: true}
+
+targets:
+  efficiency: 0.85
+
+# Detection rules. Rule types: delta, target, zscore, new_top_item, trend.
+# streak = number of consecutive strict period-over-period moves in the same direction ending at
+# the current period; the streak start is the value just before the first of those moves.
+signals:
+  efficiency_drop:
+    type: delta
+    metric: efficiency
+    threshold: -0.03            # absolute change vs previous period
+    kind: risk
+    severity: high
+    investigate: true
+    title: "Efficiency dropped at {site}"
+    questions:
+      - "Were there staffing, shift, or schedule changes at {site} during {period}?"
+      - "Did product mix or order volume change?"
+      - "Is there an equipment issue behind the downtime pattern?"
+  efficiency_gain:
+    type: delta
+    metric: efficiency
+    threshold: 0.03
+    kind: improvement
+    severity: low
+    title: "Efficiency improved at {site}"
+    questions:
+      - "What changed at {site}? Capture it so other sites can copy it."
+  below_target:
+    type: target
+    metric: efficiency
+    direction: below
+    kind: risk
+    severity: medium
+    investigate: true
+    title: "{site} is below the efficiency target"
+    questions:
+      - "Does the customer agree the target is still right for {site}?"
+  lost_hours_spike:
+    type: zscore
+    metric: lost_hours
+    threshold: 2.0
+    min_history: 3
+    min_change_rel: 0.25        # and at least 25% above the baseline, so tiny wobbles don't fire
+    kind: anomaly
+    severity: medium
+    investigate: true
+    title: "Lost hours are unusually high at {site}"
+    questions:
+      - "Which departments drove the lost hours, and was it planned?"
+  downtime_spike:
+    type: zscore
+    metric: downtime_hours
+    threshold: 2.0
+    min_history: 3
+    min_change_rel: 0.25        # and at least 25% above the baseline, so tiny wobbles don't fire
+    kind: anomaly
+    severity: medium
+    investigate: true
+    title: "Downtime is unusually high at {site}"
+    questions:
+      - "Is maintenance aware of the top downtime reason?"
+  new_downtime_driver:
+    type: new_top_item
+    breakdown: downtime_by_reason
+    top_k: 1
+    kind: risk
+    severity: medium
+    investigate: true
+    title: "New top downtime reason at {site}"
+    questions:
+      - "When did '{item}' start, and does the customer already have a fix in progress?"
+  sustained_gain:
+    type: trend
+    metric: efficiency
+    direction: up
+    periods: 3                  # consecutive monthly increases
+    min_total: 0.03             # adding up to at least 3 points
+    kind: improvement
+    severity: low
+    title: "Sustained efficiency improvement at {site}"
+    questions:
+      - "What has {site} been doing differently? Could the other sites use it?"
+  sustained_decline:
+    type: trend
+    metric: efficiency
+    direction: down
+    periods: 3
+    min_total: 0.03
+    kind: risk
+    severity: medium
+    investigate: true
+    title: "Efficiency has been sliding at {site}"
+    questions:
+      - "Is there a slow change at {site} (staffing, equipment wear, product mix) that no single month shows?"
+  data_quality:
+    type: delta
+    metric: excluded_rows
+    threshold: 10               # more excluded rows than last period by this many
+    kind: risk
+    severity: low
+    title: "More labor rows were excluded as data errors at {site}"
+    questions:
+      - "Has anything changed in how {site} records time?"
+
+investigations:
+  resolve_after_clean_periods: 2
+
+# What customer documents show. Everything here must exist in metrics/breakdowns above.
+report:
+  headline_metric: efficiency
+  key_metrics: [efficiency, earned_hours, paid_hours, lost_hours, downtime_hours, active_headcount]
+  breakdowns: [efficiency_by_department, downtime_by_reason]
+  summary_metrics: [lost_hours, downtime_hours]
+  data_notes: [excluded_rows, outlier_rows, unmatched_rows, duplicate_rows, out_of_period_rows]
+
+integrity:
+  tolerance_abs: 0.000001         # facts vs recompute, on unrounded values
+  source_summary_tolerance_rel: 0.005   # source-system totals vs recompute (warning only)
